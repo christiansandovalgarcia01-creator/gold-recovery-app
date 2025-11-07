@@ -1,123 +1,102 @@
-# train.py — entrena, selecciona el mejor modelo por sMAPE final y guarda artefactos
-import pandas as pd, numpy as np, json, joblib
-from sklearn.model_selection import TimeSeriesSplit
-from sklearn.pipeline import Pipeline
-from sklearn.compose import ColumnTransformer
-from sklearn.preprocessing import StandardScaler
-from sklearn.impute import SimpleImputer
-from sklearn.linear_model import LinearRegression
-from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
+# train.py — rápido y estable (con limpieza de objetivos)
+import os, json, joblib, numpy as np, pandas as pd
+from sklearn.ensemble import HistGradientBoostingRegressor
+from sklearn.model_selection import train_test_split
 
-RANDOM_STATE = 42
+# --- Rutas ---
+BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
+PATH_TRAIN = os.path.join(BASE_DIR, "data", "gold_recovery_train.csv")
+PATH_TEST  = os.path.join(BASE_DIR, "data", "gold_recovery_test.csv")
 
-# Rutas a tus CSV (colócalos en la carpeta data/)
-PATH_TRAIN = "data/gold_recovery_train.csv"
-PATH_TEST  = "data/gold_recovery_test.csv"
+# --- Configuración de velocidad ---
+SEED       = 42
+FAST_MODE  = True      # pon False para entreno completo
+NROWS_FAST = 8000      # filas en modo rápido
+
+def smape(y_true, y_pred):
+    y_true = np.asarray(y_true, dtype=np.float32)
+    y_pred = np.asarray(y_pred, dtype=np.float32)
+    denom = np.abs(y_true) + np.abs(y_pred)
+    denom[denom == 0] = 1.0
+    return (100.0 / len(y_true)) * np.sum(np.abs(y_pred - y_true) / denom)
 
 print("Cargando datos...")
-train = pd.read_csv(PATH_TRAIN, index_col="date", parse_dates=True).sort_index()
-test  = pd.read_csv(PATH_TEST,  index_col="date", parse_dates=True).sort_index()
+
+# Leemos test para fijar el set de features permitido
+test = pd.read_csv(PATH_TEST, nrows=(NROWS_FAST if FAST_MODE else None))
+feat_cols = [c for c in test.columns if c != "date"]
 
 targets = ["rougher.output.recovery", "final.output.recovery"]
+usecols = ["date"] + feat_cols + targets
 
-# Columnas comunes train ∩ test
-X_cols = sorted([c for c in set(train.columns) & set(test.columns) if c not in targets])
+train = pd.read_csv(
+    PATH_TRAIN,
+    usecols=usecols,
+    nrows=(NROWS_FAST if FAST_MODE else None)
+)
 
-# Filtros de consistencia física (si existen esas columnas)
-def sum_if_exists(df, like):
-    cols = df.filter(like=like).filter(regex="(_au|_ag|_pb|_sol)$").columns
-    return df[cols].sum(axis=1) if len(cols) else pd.Series(index=df.index, dtype=float)
+# Orden y tipos ligeros
+train = train.sort_values("date").reset_index(drop=True)
+X = train[feat_cols].astype("float32")
 
-tot_feed  = sum_if_exists(train, "rougher.input")
-tot_rough = sum_if_exists(train, "rougher.output")
-tot_final = sum_if_exists(train, "final.output")
+# --- Limpieza robusta ---
+# Sustituir inf por NaN en features
+X = X.replace([np.inf, -np.inf], np.nan)
 
-def valid01(s): 
-    return (~s.isna()) & (s >= 0) & (s <= 100)
+# Objetivos como float32
+y_rough = train["rougher.output.recovery"].astype("float32")
+y_final = train["final.output.recovery"].astype("float32")
 
-mask = pd.Series(True, index=train.index)
-for s in [tot_feed, tot_rough, tot_final]:
-    if s.notna().any():
-        mask &= valid01(s)
+# Clip opcional de objetivos a [0, 100] (según negocio)
+y_rough = y_rough.clip(lower=0, upper=100)
+y_final = y_final.clip(lower=0, upper=100)
 
-train = train.loc[mask].copy()
-train = train.dropna(subset=targets)
-train[targets] = train[targets].clip(0, 100)
+# Filtramos filas con NaN en objetivos (requisito de sklearn)
+mask = y_rough.notna() & y_final.notna()
+n_before = len(train)
+X = X.loc[mask].reset_index(drop=True)
+y_rough = y_rough.loc[mask].reset_index(drop=True)
+y_final = y_final.loc[mask].reset_index(drop=True)
+print(f"Filtrado objetivos: {n_before} → {len(X)} filas (sin NaN en y)")
 
-X_train = train[X_cols].copy()
-y_train = train[targets].copy()
-X_test  = test[X_cols].copy()
+# --- Split rápido (holdout) ---
+X_tr, X_va, y_r_tr, y_r_va = train_test_split(
+    X, y_rough, test_size=0.2, random_state=SEED
+)
+# Usamos el MISMO split de índices para el objetivo final
+X_tr2, X_va2, y_f_tr, y_f_va = train_test_split(
+    X, y_final, test_size=0.2, random_state=SEED
+)
 
-# Preprocesamiento: imputación mediana + escalado
-num_pipe = Pipeline([
-    ("imputer", SimpleImputer(strategy="median")),
-    ("scaler", StandardScaler())
-])
-pre = ColumnTransformer([("num", num_pipe, X_cols)], remainder="drop")
+def make_hgb():
+    return HistGradientBoostingRegressor(
+        loss="absolute_error",
+        max_depth=6,
+        learning_rate=0.08,
+        max_iter=(200 if not FAST_MODE else 120),
+        l2_regularization=1.0,
+        random_state=SEED
+    )
 
-# sMAPE y sMAPE final (25/75)
-def smape(y_true, y_pred):
-    y_true = np.asarray(y_true, float); y_pred = np.asarray(y_pred, float)
-    denom = (np.abs(y_true) + np.abs(y_pred)) / 2.0
-    mask = denom != 0
-    out = np.zeros_like(denom, float)
-    out[mask] = np.abs(y_true[mask] - y_pred[mask]) / denom[mask]
-    return float(np.mean(out) * 100)
+print("Entrenando modelos...")
+m_rough = make_hgb().fit(X_tr,  y_r_tr)
+m_final = make_hgb().fit(X_tr2, y_f_tr)
 
-def final_smape(y_true_df, y_pred_df):
-    s1 = smape(y_true_df["rougher.output.recovery"], y_pred_df["rougher.output.recovery"])
-    s2 = smape(y_true_df["final.output.recovery"],    y_pred_df["final.output.recovery"])
-    return 0.25 * s1 + 0.75 * s2
+# --- Validación ---
+pred_r = np.clip(m_rough.predict(X_va),  0, 100)
+pred_f = np.clip(m_final.predict(X_va2), 0, 100)
+s1 = smape(y_r_va, pred_r)
+s2 = smape(y_f_va, pred_f)
+s2575 = 0.25 * s1 + 0.75 * s2
+print(f"Validación — sMAPE(rougher) = {s1:.3f}")
+print(f"Validación — sMAPE(final)   = {s2:.3f}")
+print(f"Métrica 25/75               = {s2575:.3f}")
 
-# Modelos candidatos
-candidates = {
-    "linreg": Pipeline([("pre", pre), ("est", LinearRegression())]),
-    "gbr":    Pipeline([("pre", pre), ("est", GradientBoostingRegressor(random_state=RANDOM_STATE))]),
-    "rf":     Pipeline([("pre", pre), ("est", RandomForestRegressor(
-                        n_estimators=300, random_state=RANDOM_STATE, n_jobs=-1))]),
-}
+# --- Guardado comprimido ---
+print("Guardando modelos y lista de features...")
+joblib.dump(m_rough, "model_rough.pkl.gz", compress=5)
+joblib.dump(m_final, "model_final.pkl.gz", compress=5)
+with open("feature_list.json", "w", encoding="utf-8") as f:
+    json.dump(feat_cols, f, ensure_ascii=False, indent=2)
 
-# CV temporal y selección del mejor por sMAPE final
-tscv = TimeSeriesSplit(n_splits=5)
-
-def eval_pipe(pipe, X, y):
-    scores = []
-    for tr, va in tscv.split(X):
-        X_tr, X_va = X.iloc[tr], X.iloc[va]
-        y_tr, y_va = y.iloc[tr], y.iloc[va]
-
-        keep_tr = ~y_tr.isna().any(axis=1)
-        X_tr, y_tr = X_tr.loc[keep_tr], y_tr.loc[keep_tr]
-
-        m1 = Pipeline(pipe.steps); m2 = Pipeline(pipe.steps)
-        m1.fit(X_tr, y_tr["rougher.output.recovery"])
-        m2.fit(X_tr, y_tr["final.output.recovery"])
-
-        p1 = np.clip(m1.predict(X_va), 0, 100)
-        p2 = np.clip(m2.predict(X_va), 0, 100)
-        yhat = pd.DataFrame({
-            "rougher.output.recovery": p1,
-            "final.output.recovery":   p2
-        }, index=y_va.index)
-        scores.append(final_smape(y_va, yhat))
-    return float(np.mean(scores))
-
-best_name, best_score = None, 1e9
-for name, pipe in candidates.items():
-    s = eval_pipe(pipe, X_train, y_train)
-    print(f"{name}: sMAPE_final CV = {s:.3f}")
-    if s < best_score:
-        best_name, best_score = name, s
-
-print(f"Mejor modelo: {best_name}  con sMAPE_final CV = {best_score:.3f}")
-best_pipe = candidates[best_name]
-
-# Entrenamiento final por objetivo y guardado de artefactos
-model_rough = Pipeline(best_pipe.steps).fit(X_train, y_train["rougher.output.recovery"])
-model_final = Pipeline(best_pipe.steps).fit(X_train, y_train["final.output.recovery"])
-
-joblib.dump(model_rough, "model_rough.pkl")
-joblib.dump(model_final, "model_final.pkl")
-json.dump(X_cols, open("feature_list.json", "w"))
-
-print("Guardado: model_rough.pkl, model_final.pkl, feature_list.json")
+print("OK: model_rough.pkl.gz, model_final.pkl.gz, feature_list.json")
