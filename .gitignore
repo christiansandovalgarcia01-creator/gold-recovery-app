@@ -1,7 +1,22 @@
+# entornos y cach‚s
 .venv/
 __pycache__/
-*.ipynb_checkpoints
-.DS_Store
-.env
+*.pyc
+*.pyo
+*.pyd
+*.log
+
+# datos locales
 data/
+*.csv
+
+# modelos: ignora PKL; permite .pkl.gz
 *.pkl
+!*.pkl.gz
+
+# notebooks
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
